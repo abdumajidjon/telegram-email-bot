@@ -1,9 +1,3 @@
-# UptimeRobot + Render: Bot 24/7 Ishlashi
-
-## 1. Botni Render'ga tayyorlash
-
-### main.py ni yangilang (health check endpoint qo'shing):
-```python
 import sys
 import os
 import asyncio
@@ -17,7 +11,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-import threading
 
 # Environment variable dan token olish
 API_TOKEN = os.environ.get('BOT_TOKEN', "8403878780:AAGebqROs5PhBejKf5alU4lBwL-JNG-0pWs")
@@ -160,100 +153,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Bot to'xtatildi.")
-```
-
-### requirements.txt:
-```txt
-aiogram>=3.0.0
-aiohttp>=3.8.0
-```
-
-## 2. Render'da deploy qilish
-
-1. **GitHub'ga kod yuklang**
-2. **Render.com'da Web Service yarating**
-3. **Sozlamalar:**
-   - Build Command: `pip install -r requirements.txt`
-   - Start Command: `python main.py`
-   - Environment Variable: `BOT_TOKEN = your_token`
-
-4. **Deploy tugagach URL oling**, masalan:
-   `https://your-bot-name.onrender.com`
-
-## 3. UptimeRobot sozlash
-
-### 3.1. Ro'yxatdan o'tish
-1. [uptimerobot.com](https://uptimerobot.com) ga kiring
-2. **"Sign up for FREE!"** tugmasini bosing
-3. Email va parol kiriting
-
-### 3.2. Monitor yaratish
-1. Dashboard'da **"Add New Monitor"** tugmasini bosing
-
-2. **Monitor sozlamalari:**
-   - **Monitor Type**: `HTTP(s)`
-   - **Friendly Name**: `Telegram Bot Monitor`
-   - **URL**: `https://your-bot-name.onrender.com/health`
-   - **Monitoring Interval**: `5 minutes` (bepul max)
-
-3. **Alert Contacts** (ixtiyoriy):
-   - Email manzil qo'shing
-   - Agar bot ishlamasa, xabar keladi
-
-4. **"Create Monitor"** tugmasini bosing
-
-### 3.3. Natija tekshirish
-- **Status**: 🟢 UP ko'rsatishi kerak
-- **Response Time**: 200-500ms orasida bo'lishi kerak
-- **Uptime**: 100% bo'lishi kerak
-
-## 4. Ishlashini tekshirish
-
-### Bot tekshiruvi:
-1. Telegram'da botga `/start` yuboring
-2. Javob tezligi normal bo'lishi kerak (1-2 sekund)
-
-### Monitor tekshiruvi:
-1. UptimeRobot dashboard'da "UP" holatini ko'ring
-2. Response time grafigini kuzating
-
-### Render logs:
-```
-Bot va web server ishga tushmoqda...
-Web server started on port 10000
-Bot ishga tushmoqda...
-```
-
-## 5. Qo'shimcha sozlamalar
-
-### UptimeRobot bepul limits:
-- **50 ta monitor** (bizga 1 ta kerak)
-- **5 daqiqalik interval** (yetarli)
-- **2 oy log saqlash**
-
-### Render bepul limits:
-- **750 soat/oy** (31 kun)
-- **512MB RAM**
-- **Disk: 1GB**
-
-## 6. Muammolarni hal qilish
-
-### Agar bot sekin javob bersa:
-1. UptimeRobot monitoringni tekshiring
-2. Render logs'da xatolarni qidiring
-3. Health endpoint ishyotganini tekshiring: `your-url.onrender.com/health`
-
-### Agar UptimeRobot "DOWN" ko'rsatsa:
-1. URL to'g'ri ekanligini tekshiring
-2. Render service'i ishyotganini tekshiring
-3. Health endpoint 200 status qaytaryotganini tekshiring
-
-## 7. Monitoring Dashboard
-
-UptimeRobot sizga beradi:
-- **Real-time status**
-- **Uptime statistikasi**
-- **Response time grafiklari**
-- **Downtime alerts**
-
-Bu kombinatsiya bilan botingiz 24/7 ishlaydi va hech qachon "uxlamaydi"! 🚀
