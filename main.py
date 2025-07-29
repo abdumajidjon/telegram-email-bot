@@ -1,371 +1,9 @@
-import sys
-import os
-import asyncio
-import aiohttp
-import json
-import re
-from datetime import datetime
-from aiohttp import web
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-# Environment variables
-API_TOKEN = os.environ.get('BOT_TOKEN', "8403878780:AAGebqROs5PhBejKf5alU4lBwL-JNG-0pWs")
-PORT = int(os.environ.get('PORT', 8000))
-ADMIN_ID = 976525232
-
-BASE_URLS = {
-    "10m": "https://sv9.api999api.com/google/api.php",
-    "12h": "https://sv5.api999api.com/google/api.php"
-}
-
-if sys.platform.startswith("win"):
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-bot = Bot(
-    token=API_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
-)
-dp = Dispatcher(storage=MemoryStorage())
-
-# Enhanced in-memory database
-users_db = {}
-pending_users = {}
-support_tickets = {}
-user_history = {}
-maintenance_mode = False
-
-# Connection pool for faster email requests
-connector = None
-
-class Form(StatesGroup):
-    choosing_mode = State()
-    waiting_keys = State()
-    waiting_contact = State()
-    waiting_file = State()
-
-class AdminStates(StatesGroup):
-    viewing_stats = State()
-    broadcast_message = State()
-    replying_ticket = State()
-
-class SupportStates(StatesGroup):
-    waiting_message = State()
-    waiting_category = State()
-
-# Health check endpoint
-async def health_check(request):
-    return web.Response(text="Bot is running! ✅", status=200)
-
-async def create_app():
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    app.router.add_get('/health', health_check)
-    return app
-
-async def setup_connection_pool():
-    """Setup optimized connection pool for faster email requests"""
-    global connector
-    connector = aiohttp.TCPConnector(
-        limit=100,
-        limit_per_host=30,
-        keepalive_timeout=30,
-        enable_cleanup_closed=True,
-        ttl_dns_cache=300,
-        use_dns_cache=True,
-    )
-
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
-def is_approved_user(user_id: int) -> bool:
-    return str(user_id) in users_db and users_db[str(user_id)]['status'] == 'approved'
-
-def save_user(user_id: int, user_data: dict):
-    users_db[str(user_id)] = user_data
-
-def get_stats():
-    total_users = len(users_db)
-    approved_users = len([u for u in users_db.values() if u['status'] == 'approved'])
-    pending_users_count = len(pending_users)
-    rejected_users = len([u for u in users_db.values() if u['status'] == 'rejected'])
-    active_tickets = len([t for t in support_tickets.values() if t['status'] == 'open'])
+admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Javob berish", callback_data=f"reply_ticket_{ticket_id}")],
+        [InlineKeyboardButton(text="✅ Yopish", callback_data=f"close_ticket_{ticket_id}")]
+    ])
     
-    return {
-        'total': total_users,
-        'approved': approved_users,
-        'pending': pending_users_count,
-        'rejected': rejected_users,
-        'active_tickets': active_tickets
-    }
-
-def extract_keys_from_text(text: str) -> list[str]:
-    """Enhanced key extraction with multiple patterns"""
-    keys = []
-    
-    # Pattern 1: Key : value
-    pattern1 = re.findall(r'Key\s*:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
-    keys.extend([k.strip() for k in pattern1])
-    
-    # Pattern 2: Simple lines (not URLs, not empty, not common words)
-    lines = text.strip().split('\n')
-    for line in lines:
-        line = line.strip()
-        if (line and 
-            not line.startswith(('http', 'www', 'Key', 'Link')) and 
-            len(line) > 5 and 
-            not any(word in line.lower() for word in ['tool', 'email', 'password', 'login'])):
-            keys.append(line)
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_keys = []
-    for key in keys:
-        if key not in seen:
-            seen.add(key)
-            unique_keys.append(key)
-    
-    return unique_keys
-
-def extract_keys_from_file_content(content: str, filename: str) -> list[str]:
-    """Extract keys from uploaded file content"""
-    keys = []
-    
-    try:
-        if filename.endswith('.json'):
-            # Try to parse as JSON
-            data = json.loads(content)
-            if isinstance(data, list):
-                keys = [str(item) for item in data if str(item).strip()]
-            elif isinstance(data, dict):
-                # Look for common key patterns in JSON
-                for key in ['keys', 'tokens', 'values', 'data']:
-                    if key in data and isinstance(data[key], list):
-                        keys = [str(item) for item in data[key] if str(item).strip()]
-                        break
-        
-        elif filename.endswith('.csv'):
-            # Parse CSV content
-            lines = content.strip().split('\n')
-            for line in lines[1:]:  # Skip header
-                parts = line.split(',')
-                if parts:
-                    keys.append(parts[0].strip().strip('"'))
-        
-        else:
-            # Treat as plain text
-            keys = extract_keys_from_text(content)
-    
-    except Exception as e:
-        print(f"Error parsing file {filename}: {e}")
-        # Fallback to text parsing
-        keys = extract_keys_from_text(content)
-    
-    return keys
-
-def format_emails_monospace(emails: list[str]) -> str:
-    lines = [f"{i+1} - `{email}`" for i, email in enumerate(emails)]
-    lines.append(f"\n`AKA999aka`")
-    return "\n".join(lines)
-
-async def get_email_from_key_optimized(session: aiohttp.ClientSession, key: str, minutes: int, base_url: str) -> str | None:
-    """Optimized email fetching with faster timeouts"""
-    url = f"{base_url}?key_value={key}&timelive={minutes}"
-    
-    for attempt in range(3):  # Reduced from 5 to 3 attempts
-        try:
-            timeout = aiohttp.ClientTimeout(total=8)  # Reduced from 30 to 8 seconds
-            async with session.get(url, timeout=timeout) as resp:
-                text = await resp.text()
-                print(f"API response for {key}: {text[:50]}...")
-                if "@" in text:
-                    email = text.strip().split("|")[0]
-                    return email
-        except Exception as e:
-            print(f"[ERROR] attempt {attempt+1} for key {key}: {e}")
-        
-        if attempt < 2:  # Don't sleep after last attempt
-            await asyncio.sleep(0.3)  # Reduced from 1 to 0.3 seconds
-    
-    return None
-
-async def get_multiple_emails_parallel(keys: list[str], minutes: int, base_url: str) -> tuple[list[str], list[str]]:
-    """Get emails in parallel for faster processing"""
-    global connector
-    
-    if not connector:
-        await setup_connection_pool()
-    
-    async with aiohttp.ClientSession(connector=connector) as session:
-        # Create tasks for parallel execution
-        tasks = [
-            get_email_from_key_optimized(session, key, minutes, base_url)
-            for key in keys
-        ]
-        
-        # Execute all requests in parallel
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        emails = []
-        failed = []
-        
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                failed.append(keys[i])
-            elif result:
-                emails.append(result)
-            else:
-                failed.append(keys[i])
-    
-    return emails, failed
-
-def save_user_history(user_id: int, keys_count: int, emails_count: int, mode: str):
-    """Save user activity history"""
-    if str(user_id) not in user_history:
-        user_history[str(user_id)] = []
-    
-    user_history[str(user_id)].append({
-        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'keys_count': keys_count,
-        'emails_count': emails_count,
-        'mode': mode
-    })
-    
-    # Keep only last 10 entries
-    user_history[str(user_id)] = user_history[str(user_id)][-10:]
-
-async def broadcast_message(message_text: str, exclude_user_id: int = None):
-    """Send message to all approved users"""
-    sent_count = 0
-    failed_count = 0
-    
-    for user_id, user_data in users_db.items():
-        if user_data['status'] == 'approved' and int(user_id) != exclude_user_id:
-            try:
-                await bot.send_message(int(user_id), message_text)
-                sent_count += 1
-                await asyncio.sleep(0.1)  # Avoid rate limiting
-            except Exception as e:
-                print(f"Failed to send broadcast to {user_id}: {e}")
-                failed_count += 1
-    
-    return sent_count, failed_count
-
-@dp.message(F.text == "/start")
-async def cmd_start(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    
-    # Maintenance mode check
-    if maintenance_mode and not is_admin(user_id):
-        await message.answer(
-            "🔧 *Bot yangilanmoqda...*\n\n"
-            "Iltimos, biroz kutib turing. "
-            "Yangilanish tugagach xabar beramiz.",
-            reply_markup=types.ReplyKeyboardRemove()
-        )
-        return
-    
-    # Admin uchun
-    if is_admin(user_id):
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users")],
-            [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")],
-            [InlineKeyboardButton(text="📢 Xabar yuborish", callback_data="admin_broadcast")],
-            [InlineKeyboardButton(text="🎫 Support tikетlar", callback_data="admin_tickets")],
-            [InlineKeyboardButton(text="🔧 Sozlamalar", callback_data="admin_settings")],
-            [InlineKeyboardButton(text="📩 Botdan foydalanish", callback_data="use_bot")]
-        ])
-        await message.answer(
-            "🔧 *Admin Panel*\n\n"
-            f"Salom admin! Bot holatini boshqaring.\n"
-            f"Maintenance: {'🔴 ON' if maintenance_mode else '🟢 OFF'}",
-            reply_markup=keyboard
-        )
-        return
-    
-    # Tasdiqlangan foydalanuvchi uchun
-    if is_approved_user(user_id):
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📩 10 daqiqa pochta", callback_data="mode_10m")],
-            [InlineKeyboardButton(text="📬 12 soat pochta", callback_data="mode_12h")],
-            [InlineKeyboardButton(text="📁 Fayl yuklash", callback_data="upload_file")],
-            [InlineKeyboardButton(text="📞 Admin bilan bog'lanish", callback_data="contact_admin")],
-            [InlineKeyboardButton(text="📊 Mening statistikam", callback_data="my_stats")],
-            [InlineKeyboardButton(text="❓ Yordam", callback_data="help")]
-        ])
-
-        await state.set_state(Form.choosing_mode)
-        await message.answer(
-            "✅ *Xush kelibsiz!*\n\n"
-            "Siz tasdiqlangan foydalanuvchisiz. Kerakli variantni tanlang:",
-            reply_markup=keyboard
-        )
-        return
-    
-    # Yangi foydalanuvchi yoki kutilayotgan
-    if str(user_id) not in users_db:
-        contact_keyboard = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="📱 Kontakt ulashish", request_contact=True)]],
-            resize_keyboard=True,
-            one_time_keyboard=True
-        )
-        await state.set_state(Form.waiting_contact)
-        await message.answer(
-            "👋 *Salom!*\n\n"
-            "Bu bot faqat ro'yxatdan o'tgan foydalanuvchilar uchun.\n\n"
-            "📋 *Ro'yxatdan o'tish jarayoni:*\n"
-            "1. Kontaktingizni ulashing\n"
-            "2. Admin tasdiqlashini kuting\n"
-            "3. Botdan foydalanishni boshlang\n\n"
-            "Davom etish uchun kontaktingizni ulashing 👇",
-            reply_markup=contact_keyboard
-        )
-    else:
-        user_status = users_db[str(user_id)]['status']
-        if user_status == 'rejected':
-            # Rejected user can re-request
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Qayta so'rov yuborish", callback_data="re_request")]
-            ])
-            await message.answer(
-                "❌ *So'rovingiz rad etilgan*\n\n"
-                "Agar xatolik bo'lgan deb hisoblasangiz, "
-                "qayta so'rov yuborishingiz mumkin.",
-                reply_markup=keyboard
-            )
-        else:
-            await message.answer(
-                "⏳ *Kutilmoqda...*\n\n"
-                "Sizning so'rovingiz admin tomonidan ko'rib chiqilmoqda.\n"
-                "Tasdiqlangandan keyin xabar olasiz."
-            )
-
-@dp.callback_query(F.data == "re_request")
-async def handle_re_request(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    
-    if str(user_id) in users_db:
-        # Move from rejected to pending
-        user_data = users_db[str(user_id)]
-        user_data['status'] = 'pending'
-        user_data['re_requested_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        pending_users[str(user_id)] = user_data
-        
-        # Notify admin
-        admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"approve_{user_id}"),
-                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject_{user_id}")
-            ]
-        ])
-        
-        admin_message = (
+    admin_message = (
         f"🎫 *Yangi support tiket*\n\n"
         f"👤 Foydalanuvchi: {ticket_data['user_name']}\n"
         f"🆔 ID: `{user_id}`\n"
@@ -445,7 +83,112 @@ async def admin_users_list(callback: CallbackQuery):
             )
     
     # Split long messages
-    if len(users_text) > 4000:
+    if len(keys) > 50:
+        await message.answer(f"❌ Maksimal 50 ta kalit. Sizda {len(keys)} ta.\n\nFayl yuklash funksiyasidan foydalaning!")
+        return
+
+    # Processing message with progress
+    processing_msg = await message.answer(
+        f"⚡ *Email olish boshlanmoqda...*\n\n"
+        f"📊 Kalitlar: {len(keys)} ta\n"
+        f"🚀 Tez rejim: Parallel processing\n"
+        f"⏱️ Taxminiy vaqt: {len(keys) * 0.4:.1f} sekund\n\n"
+        f"⏳ Iltimos kuting..."
+    )
+    
+    try:
+        # Use optimized parallel processing
+        emails, failed = await get_multiple_emails_parallel(keys, minutes, base_url)
+        
+        # Save to history
+        mode_name = "10 daqiqa" if mode == "10m" else "12 soat"
+        save_user_history(user_id, len(keys), len(emails), mode)
+        
+        # Delete processing message
+        await processing_msg.delete()
+        
+        if emails:
+            # Split emails into chunks if too many
+            if len(emails) > 20:
+                chunks = [emails[i:i+20] for i in range(0, len(emails), 20)]
+                for i, chunk in enumerate(chunks):
+                    chunk_text = format_emails_monospace(chunk)
+                    await message.answer(f"📧 *Emaillar ({i+1}/{len(chunks)} qism):*\n\n{chunk_text}")
+                    await asyncio.sleep(0.5)  # Small delay between chunks
+            else:
+                await message.answer(f"📧 *Emaillar:*\n\n{format_emails_monospace(emails)}")
+        
+        if failed:
+            failed_text = "❌ *Muvaffaqiyatsiz kalitlar:*\n\n"
+            for i, key in enumerate(failed[:10], 1):
+                failed_text += f"{i}. `{key}`\n"
+            
+            if len(failed) > 10:
+                failed_text += f"\n... va yana {len(failed)-10} ta"
+            
+            await message.answer(failed_text)
+        
+        # Summary with statistics
+        success_rate = len(emails) / len(keys) * 100 if keys else 0
+        summary_text = (
+            f"📊 *Natija*\n\n"
+            f"✅ Muvaffaqiyatli: {len(emails)}\n"
+            f"❌ Xatolik: {len(failed)}\n"
+            f"📈 Muvaffaqiyat: {success_rate:.1f}%\n"
+            f"⚡ Rejim: {mode_name}\n\n"
+        )
+        
+        if is_admin(user_id):
+            summary_text += "🔧 *Admin Panel*"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users")],
+                [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")],
+                [InlineKeyboardButton(text="📩 Yana ishlatish", callback_data="use_bot")]
+            ])
+        else:
+            summary_text += "📱 *Yana ishlatish uchun tugmalardan foydalaning*"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📩 10 daqiqa", callback_data="mode_10m")],
+                [InlineKeyboardButton(text="📬 12 soat", callback_data="mode_12h")],
+                [InlineKeyboardButton(text="📁 Fayl yuklash", callback_data="upload_file")]
+            ])
+        
+        await message.answer(summary_text, reply_markup=keyboard)
+        
+    except Exception as e:
+        print(f"Email processing error: {e}")
+        await processing_msg.edit_text("❌ Email olishda xatolik yuz berdi! Qayta urinib ko'ring.")
+    
+    await state.set_state(Form.choosing_mode)
+
+async def start_web_server():
+    app = await create_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f"Web server started on port {PORT}")
+
+async def main():
+    print("🚀 Professional Bot ishga tushmoqda...")
+    print(f"👤 Admin ID: {ADMIN_ID}")
+    print(f"🌐 Port: {PORT}")
+    
+    # Setup connection pool for faster performance
+    await setup_connection_pool()
+    print("⚡ Connection pool initialized")
+    
+    # Start web server in background
+    asyncio.create_task(start_web_server())
+    
+    # Start bot polling
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("🛑 Bot to'xtatildi.")users_text) > 4000:
         parts = [users_text[i:i+4000] for i in range(0, len(users_text), 4000)]
         for part in parts:
             await callback.message.answer(part)
@@ -969,17 +712,564 @@ async def handle_keys(message: Message, state: FSMContext):
         )
         return
     
-    if len(keys) > 50:
-        await message.answer(f"❌ Maksimal 50 ta kalit. Sizda {len(keys)} ta.\n\nFayl yuklash funksiyasidan foydalaning!")
-        return
+    if len(import sys
+import os
+import asyncio
+import aiohttp
+import json
+import re
+from datetime import datetime
+from aiohttp import web
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-    # Processing message with progress
-    processing_msg = await message.answer(
-        f"⚡ *Email olish boshlanmoqda...*\n\n"
-        f"📊 Kalitlar: {len(keys)} ta\n"
+# Environment variables
+API_TOKEN = os.environ.get('BOT_TOKEN', "8403878780:AAGebqROs5PhBejKf5alU4lBwL-JNG-0pWs")
+PORT = int(os.environ.get('PORT', 8000))
+ADMIN_ID = 976525232
+
+BASE_URLS = {
+    "10m": "https://sv9.api999api.com/google/api.php",
+    "12h": "https://sv5.api999api.com/google/api.php"
+}
+
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+bot = Bot(
+    token=API_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
+)
+dp = Dispatcher(storage=MemoryStorage())
+
+# Enhanced in-memory database
+users_db = {}
+pending_users = {}
+support_tickets = {}
+user_history = {}
+maintenance_mode = False
+
+# Connection pool for faster email requests
+connector = None
+
+class Form(StatesGroup):
+    choosing_mode = State()
+    waiting_keys = State()
+    waiting_contact = State()
+    waiting_file = State()
+
+class AdminStates(StatesGroup):
+    viewing_stats = State()
+    broadcast_message = State()
+    replying_ticket = State()
+
+class SupportStates(StatesGroup):
+    waiting_message = State()
+    waiting_category = State()
+
+# Health check endpoint
+async def health_check(request):
+    return web.Response(text="Bot is running! ✅", status=200)
+
+async def create_app():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    return app
+
+async def setup_connection_pool():
+    """Setup optimized connection pool for faster email requests"""
+    global connector
+    connector = aiohttp.TCPConnector(
+        limit=100,
+        limit_per_host=30,
+        keepalive_timeout=30,
+        enable_cleanup_closed=True,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+    )
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+def is_approved_user(user_id: int) -> bool:
+    return str(user_id) in users_db and users_db[str(user_id)]['status'] == 'approved'
+
+def save_user(user_id: int, user_data: dict):
+    users_db[str(user_id)] = user_data
+
+def get_stats():
+    total_users = len(users_db)
+    approved_users = len([u for u in users_db.values() if u['status'] == 'approved'])
+    pending_users_count = len(pending_users)
+    rejected_users = len([u for u in users_db.values() if u['status'] == 'rejected'])
+    active_tickets = len([t for t in support_tickets.values() if t['status'] == 'open'])
+    
+    return {
+        'total': total_users,
+        'approved': approved_users,
+        'pending': pending_users_count,
+        'rejected': rejected_users,
+        'active_tickets': active_tickets
+    }
+
+def extract_keys_from_text(text: str) -> list[str]:
+    """Enhanced key extraction with multiple patterns"""
+    keys = []
+    
+    # Pattern 1: Key : value
+    pattern1 = re.findall(r'Key\s*:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
+    keys.extend([k.strip() for k in pattern1])
+    
+    # Pattern 2: Simple lines (not URLs, not empty, not common words)
+    lines = text.strip().split('\n')
+    for line in lines:
+        line = line.strip()
+        if (line and 
+            not line.startswith(('http', 'www', 'Key', 'Link')) and 
+            len(line) > 5 and 
+            not any(word in line.lower() for word in ['tool', 'email', 'password', 'login'])):
+            keys.append(line)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_keys = []
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            unique_keys.append(key)
+    
+    return unique_keys
+
+def extract_keys_from_file_content(content: str, filename: str) -> list[str]:
+    """Extract keys from uploaded file content"""
+    keys = []
+    
+    try:
+        if filename.endswith('.json'):
+            # Try to parse as JSON
+            data = json.loads(content)
+            if isinstance(data, list):
+                keys = [str(item) for item in data if str(item).strip()]
+            elif isinstance(data, dict):
+                # Look for common key patterns in JSON
+                for key in ['keys', 'tokens', 'values', 'data']:
+                    if key in data and isinstance(data[key], list):
+                        keys = [str(item) for item in data[key] if str(item).strip()]
+                        break
+        
+        elif filename.endswith('.csv'):
+            # Parse CSV content
+            lines = content.strip().split('\n')
+            for line in lines[1:]:  # Skip header
+                parts = line.split(',')
+                if parts:
+                    keys.append(parts[0].strip().strip('"'))
+        
+        else:
+            # Treat as plain text
+            keys = extract_keys_from_text(content)
+    
+    except Exception as e:
+        print(f"Error parsing file {filename}: {e}")
+        # Fallback to text parsing
+        keys = extract_keys_from_text(content)
+    
+    return keys
+
+def format_emails_monospace(emails: list[str]) -> str:
+    lines = [f"{i+1} - `{email}`" for i, email in enumerate(emails)]
+    lines.append(f"\n`AKA999aka`")
+    return "\n".join(lines)
+
+async def get_email_from_key_optimized(session: aiohttp.ClientSession, key: str, minutes: int, base_url: str) -> str | None:
+    """Optimized email fetching with faster timeouts"""
+    url = f"{base_url}?key_value={key}&timelive={minutes}"
+    
+    for attempt in range(3):  # Reduced from 5 to 3 attempts
+        try:
+            timeout = aiohttp.ClientTimeout(total=8)  # Reduced from 30 to 8 seconds
+            async with session.get(url, timeout=timeout) as resp:
+                text = await resp.text()
+                print(f"API response for {key}: {text[:50]}...")
+                if "@" in text:
+                    email = text.strip().split("|")[0]
+                    return email
+        except Exception as e:
+            print(f"[ERROR] attempt {attempt+1} for key {key}: {e}")
+        
+        if attempt < 2:  # Don't sleep after last attempt
+            await asyncio.sleep(0.3)  # Reduced from 1 to 0.3 seconds
+    
+    return None
+
+async def get_multiple_emails_parallel(keys: list[str], minutes: int, base_url: str) -> tuple[list[str], list[str]]:
+    """Get emails in parallel for faster processing"""
+    global connector
+    
+    if not connector:
+        await setup_connection_pool()
+    
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # Create tasks for parallel execution
+        tasks = [
+            get_email_from_key_optimized(session, key, minutes, base_url)
+            for key in keys
+        ]
+        
+        # Execute all requests in parallel
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        emails = []
+        failed = []
+        
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                failed.append(keys[i])
+            elif result:
+                emails.append(result)
+            else:
+                failed.append(keys[i])
+    
+    return emails, failed
+
+def save_user_history(user_id: int, keys_count: int, emails_count: int, mode: str):
+    """Save user activity history"""
+    if str(user_id) not in user_history:
+        user_history[str(user_id)] = []
+    
+    user_history[str(user_id)].append({
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'keys_count': keys_count,
+        'emails_count': emails_count,
+        'mode': mode
+    })
+    
+    # Keep only last 10 entries
+    user_history[str(user_id)] = user_history[str(user_id)][-10:]
+
+async def broadcast_message(message_text: str, exclude_user_id: int = None):
+    """Send message to all approved users"""
+    sent_count = 0
+    failed_count = 0
+    
+    for user_id, user_data in users_db.items():
+        if user_data['status'] == 'approved' and int(user_id) != exclude_user_id:
+            try:
+                await bot.send_message(int(user_id), message_text)
+                sent_count += 1
+                await asyncio.sleep(0.1)  # Avoid rate limiting
+            except Exception as e:
+                print(f"Failed to send broadcast to {user_id}: {e}")
+                failed_count += 1
+    
+    return sent_count, failed_count
+
+@dp.message(F.text == "/start")
+async def cmd_start(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    # Maintenance mode check
+    if maintenance_mode and not is_admin(user_id):
+        await message.answer(
+            "🔧 *Bot yangilanmoqda...*\n\n"
+            "Iltimos, biroz kutib turing. "
+            "Yangilanish tugagach xabar beramiz.",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        return
+    
+    # Admin uchun
+    if is_admin(user_id):
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users")],
+            [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="📢 Xabar yuborish", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="🎫 Support tikеtlar", callback_data="admin_tickets")],
+            [InlineKeyboardButton(text="🔧 Sozlamalar", callback_data="admin_settings")],
+            [InlineKeyboardButton(text="📩 Botdan foydalanish", callback_data="use_bot")]
+        ])
+        await message.answer(
+            "🔧 *Admin Panel*\n\n"
+            f"Salom admin! Bot holatini boshqaring.\n"
+            f"Maintenance: {'🔴 ON' if maintenance_mode else '🟢 OFF'}",
+            reply_markup=keyboard
+        )
+        return
+    
+    # Tasdiqlangan foydalanuvchi uchun
+    if is_approved_user(user_id):
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📩 10 daqiqa pochta", callback_data="mode_10m")],
+            [InlineKeyboardButton(text="📬 12 soat pochta", callback_data="mode_12h")],
+            [InlineKeyboardButton(text="📁 Fayl yuklash", callback_data="upload_file")],
+            [InlineKeyboardButton(text="📞 Admin bilan bog'lanish", callback_data="contact_admin")],
+            [InlineKeyboardButton(text="📊 Mening statistikam", callback_data="my_stats")],
+            [InlineKeyboardButton(text="❓ Yordam", callback_data="help")]
+        ])
+
+        await state.set_state(Form.choosing_mode)
+        await message.answer(
+            "✅ *Xush kelibsiz!*\n\n"
+            "Siz tasdiqlangan foydalanuvchisiz. Kerakli variantni tanlang:",
+            reply_markup=keyboard
+        )
+        return
+    
+    # Yangi foydalanuvchi yoki kutilayotgan
+    if str(user_id) not in users_db:
+        contact_keyboard = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📱 Kontakt ulashish", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        await state.set_state(Form.waiting_contact)
+        await message.answer(
+            "👋 *Salom!*\n\n"
+            "Bu bot faqat ro'yxatdan o'tgan foydalanuvchilar uchun.\n\n"
+            "📋 *Ro'yxatdan o'tish jarayoni:*\n"
+            "1. Kontaktingizni ulashing\n"
+            "2. Admin tasdiqlashini kuting\n"
+            "3. Botdan foydalanishni boshlang\n\n"
+            "Davom etish uchun kontaktingizni ulashing 👇",
+            reply_markup=contact_keyboard
+        )
+    else:
+        user_status = users_db[str(user_id)]['status']
+        if user_status == 'rejected':
+            # Rejected user can re-request
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Qayta so'rov yuborish", callback_data="re_request")]
+            ])
+            await message.answer(
+                "❌ *So'rovingiz rad etilgan*\n\n"
+                "Agar xatolik bo'lgan deb hisoblasangiz, "
+                "qayta so'rov yuborishingiz mumkin.",
+                reply_markup=keyboard
+            )
+        else:
+            await message.answer(
+                "⏳ *Kutilmoqda...*\n\n"
+                "Sizning so'rovingiz admin tomonidan ko'rib chiqilmoqda.\n"
+                "Tasdiqlangandan keyin xabar olasiz."
+            )
+
+@dp.callback_query(F.data == "re_request")
+async def handle_re_request(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if str(user_id) in users_db:
+        # Move from rejected to pending
+        user_data = users_db[str(user_id)]
+        user_data['status'] = 'pending'
+        user_data['re_requested_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        pending_users[str(user_id)] = user_data
+        
+        # Notify admin
+        admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"approve_{user_id}"),
+                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject_{user_id}")
+            ]
+        ])
+        
+        admin_message = (
+            f"🔄 *Qayta so'rov*\n\n"
+            f"👨‍💼 Ism: {user_data['first_name']} {user_data['last_name']}\n"
+            f"🆔 Username: @{user_data['username']}\n"
+            f"📱 Telefon: {user_data['phone']}\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"📅 Birinchi so'rov: {user_data['registered_at']}\n"
+            f"🔄 Qayta so'rov: {user_data['re_requested_at']}\n\n"
+            f"⚠️ Bu foydalanuvchi avval rad etilgan edi."
+        )
+        
+        try:
+            await bot.send_message(ADMIN_ID, admin_message, reply_markup=admin_keyboard)
+            await callback.message.edit_text(
+                "✅ *Qayta so'rov yuborildi!*\n\n"
+                "Admin ko'rib chiqadi va javob beradi."
+            )
+        except Exception as e:
+            print(f"Admin'ga qayta so'rov yuborishda xatolik: {e}")
+            await callback.message.edit_text("❌ Xatolik yuz berdi. Qayta urinib ko'ring.")
+    
+    await callback.answer()
+
+@dp.message(Form.waiting_contact, F.contact)
+async def handle_contact(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    contact = message.contact
+    
+    print(f"Contact received from user {user_id}")
+    
+    user_data = {
+        'user_id': user_id,
+        'first_name': message.from_user.first_name or "Noma'lum",
+        'last_name': message.from_user.last_name or "",
+        'username': message.from_user.username or "Yo'q",
+        'phone': contact.phone_number,
+        'status': 'pending',
+        'registered_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    pending_users[str(user_id)] = user_data
+    print(f"User {user_id} added to pending users")
+    
+    # Admin'ga xabar yuborish
+    admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"approve_{user_id}"),
+            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject_{user_id}")
+        ]
+    ])
+    
+    admin_message = (
+        f"👤 *Yangi foydalanuvchi so'rovi*\n\n"
+        f"👨‍💼 Ism: {user_data['first_name']} {user_data['last_name']}\n"
+        f"🆔 Username: @{user_data['username']}\n"
+        f"📱 Telefon: {user_data['phone']}\n"
+        f"🆔 ID: `{user_id}`\n"
+        f"📅 Vaqt: {user_data['registered_at']}"
+    )
+    
+    try:
+        await bot.send_message(ADMIN_ID, admin_message, reply_markup=admin_keyboard)
+        print(f"Admin message sent for user {user_id}")
+        await message.answer(
+            "✅ *So'rov yuborildi!*\n\n"
+            "📋 *Keyingi qadamlar:*\n"
+            "• Sizning ma'lumotlaringiz admin'ga yuborildi\n"
+            "• Admin ko'rib chiqadi (odatda 24 soat ichida)\n"
+            "• Tasdiqlangandan keyin xabar olasiz\n"
+            "• Keyin botdan to'liq foydalanishingiz mumkin",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+    except Exception as e:
+        print(f"Admin'ga xabar yuborishda xatolik: {e}")
+        await message.answer(
+            "❌ Xatolik yuz berdi. Iltimos qayta urinib ko'ring.",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+    
+    await state.clear()
+
+# File upload handler
+@dp.callback_query(F.data == "upload_file")
+async def upload_file_request(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    if not is_approved_user(user_id):
+        await callback.answer("Sizda ruxsat yo'q!")
+        return
+    
+    await state.set_state(Form.waiting_file)
+    await callback.message.answer(
+        "📁 *Fayl yuklash*\n\n"
+        "Quyidagi formatdagi fayllarni yuklashingiz mumkin:\n\n"
+        "📄 *.txt* - har bir kalit yangi qatorda\n"
+        "📊 *.csv* - CSV format (birinchi ustun kalitlar)\n"
+        "🔧 *.json* - JSON format\n\n"
+        "Faylni yuboring:"
+    )
+    await callback.answer()
+
+@dp.message(Form.waiting_file, F.document)
+async def handle_file_upload(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    if not is_approved_user(user_id):
+        await message.answer("❌ Sizda ruxsat yo'q!")
+        return
+    
+    document = message.document
+    
+    # Check file size (max 5MB)
+    if document.file_size > 5 * 1024 * 1024:
+        await message.answer("❌ Fayl hajmi 5MB dan kichik bo'lishi kerak!")
+        return
+    
+    # Check file extension
+    filename = document.file_name.lower()
+    allowed_extensions = ['.txt', '.csv', '.json']
+    
+    if not any(filename.endswith(ext) for ext in allowed_extensions):
+        await message.answer(
+            "❌ Faqat quyidagi formatlar qabul qilinadi:\n"
+            "• .txt\n• .csv\n• .json"
+        )
+        return
+    
+    try:
+        # Download file
+        file_info = await bot.get_file(document.file_id)
+        file_content = await bot.download_file(file_info.file_path)
+        
+        # Read content
+        content = file_content.read().decode('utf-8')
+        
+        # Extract keys
+        keys = extract_keys_from_file_content(content, filename)
+        
+        if not keys:
+            await message.answer("❌ Faylda kalitlar topilmadi!")
+            return
+        
+        if len(keys) > 100:
+            await message.answer(f"❌ Maksimal 100 ta kalit. Sizda {len(keys)} ta.")
+            return
+        
+        # Ask for mode selection
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📩 10 daqiqa", callback_data="file_mode_10m")],
+            [InlineKeyboardButton(text="📬 12 soat", callback_data="file_mode_12h")]
+        ])
+        
+        await state.update_data(file_keys=keys)
+        await message.answer(
+            f"✅ *Fayl muvaffaqiyatli yuklandi!*\n\n"
+            f"📊 Topilgan kalitlar: {len(keys)}\n"
+            f"📁 Fayl nomi: {document.file_name}\n\n"
+            "Pochta turini tanlang:",
+            reply_markup=keyboard
+        )
+        
+    except Exception as e:
+        print(f"File processing error: {e}")
+        await message.answer("❌ Faylni qayta ishlashda xatolik yuz berdi!")
+
+@dp.callback_query(F.data.startswith("file_mode_"))
+async def handle_file_mode(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    if not is_approved_user(user_id):
+        await callback.answer("Sizda ruxsat yo'q!")
+        return
+    
+    data = await state.get_data()
+    keys = data.get('file_keys', [])
+    
+    if not keys:
+        await callback.message.answer("❌ Kalitlar topilmadi. Qayta urinib ko'ring.")
+        return
+    
+    mode = callback.data.replace("file_mode_", "")
+    minutes = 10 if mode == "10m" else 720
+    base_url = BASE_URLS.get(mode, BASE_URLS["10m"])
+    
+    # Processing message
+    processing_msg = await callback.message.answer(
+        f"⚡ *Email olish jarayoni boshlanmoqda...*\n\n"
+        f"📊 Kalitlar soni: {len(keys)}\n"
         f"🚀 Tez rejim: Parallel processing\n"
-        f"⏱️ Taxminiy vaqt: {len(keys) * 0.4:.1f} sekund\n\n"
-        f"⏳ Iltimos kuting..."
+        f"⏱️ Taxminiy vaqt: {len(keys) * 0.5:.1f} sekund\n\n"
+        f"Iltimos kuting..."
     )
     
     try:
@@ -987,90 +1277,146 @@ async def handle_keys(message: Message, state: FSMContext):
         emails, failed = await get_multiple_emails_parallel(keys, minutes, base_url)
         
         # Save to history
-        save_user_history(user_id, len(keys), len(emails), mode)
+        save_user_history(user_id, len(keys), len(emails), f"file_{mode}")
+        
+        if emails:
+            await callback.message.answer(format_emails_monospace(emails))
+        
+        if failed:
+            await callback.message.answer(
+                f"❌ Muvaffaqiyatsiz ({len(failed)} ta):\n" + 
+                "\n".join([f"• `{key}`" for key in failed[:10]]) +
+                (f"\n... va yana {len(failed)-10} ta" if len(failed) > 10 else "")
+            )
+        
+        # Summary
+        await callback.message.answer(
+            f"📊 *Natija*\n\n"
+            f"✅ Muvaffaqiyatli: {len(emails)}\n"
+            f"❌ Muvaffaqiyatsiz: {len(failed)}\n"
+            f"📊 Jami: {len(keys)}\n"
+            f"📈 Muvaffaqiyat darajasi: {len(emails)/len(keys)*100:.1f}%"
+        )
         
         # Delete processing message
         await processing_msg.delete()
         
-        if emails:
-            # Split emails into chunks if too many
-            if len(emails) > 20:
-                chunks = [emails[i:i+20] for i in range(0, len(emails), 20)]
-                for i, chunk in enumerate(chunks):
-                    chunk_text = format_emails_monospace(chunk)
-                    await message.answer(f"📧 *Emaillar ({i+1}/{len(chunks)} qism):*\n\n{chunk_text}")
-                    await asyncio.sleep(0.5)  # Small delay between chunks
-            else:
-                await message.answer(f"📧 *Emaillar:*\n\n{format_emails_monospace(emails)}")
-        
-        if failed:
-            failed_text = "❌ *Muvaffaqiyatsiz kalitlar:*\n\n"
-            for i, key in enumerate(failed[:10], 1):
-                failed_text += f"{i}. `{key}`\n"
-            
-            if len(failed) > 10:
-                failed_text += f"\n... va yana {len(failed)-10} ta"
-            
-            await message.answer(failed_text)
-        
-        # Summary with statistics
-        success_rate = len(emails) / len(keys) * 100 if keys else 0
-        summary_text = (
-            f"📊 *Natija*\n\n"
-            f"✅ Muvaffaqiyatli: {len(emails)}\n"
-            f"❌ Xatolik: {len(failed)}\n"
-            f"📈 Muvaffaqiyat: {success_rate:.1f}%\n"
-            f"⚡ Rejim: {mode_name}\n\n"
-        )
-        
-        if is_admin(user_id):
-            summary_text += "🔧 *Admin Panel*"
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users")],
-                [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")],
-                [InlineKeyboardButton(text="📩 Yana ishlatish", callback_data="use_bot")]
-            ])
-        else:
-            summary_text += "📱 *Yana ishlatish uchun tugmalardan foydalaning*"
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📩 10 daqiqa", callback_data="mode_10m")],
-                [InlineKeyboardButton(text="📬 12 soat", callback_data="mode_12h")],
-                [InlineKeyboardButton(text="📁 Fayl yuklash", callback_data="upload_file")]
-            ])
-        
-        await message.answer(summary_text, reply_markup=keyboard)
-        
     except Exception as e:
-        print(f"Email processing error: {e}")
-        await processing_msg.edit_text("❌ Email olishda xatolik yuz berdi! Qayta urinib ko'ring.")
+        print(f"File email processing error: {e}")
+        await callback.message.answer("❌ Email olishda xatolik yuz berdi!")
     
-    await state.set_state(Form.choosing_mode)
+    await state.clear()
+    await callback.answer()
 
-async def start_web_server():
-    app = await create_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    print(f"Web server started on port {PORT}")
+# Support system
+@dp.callback_query(F.data == "contact_admin")
+async def contact_admin_menu(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    if not is_approved_user(user_id):
+        await callback.answer("Sizda ruxsat yo'q!")
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🐛 Texnik muammo", callback_data="support_bug")],
+        [InlineKeyboardButton(text="❓ Savol", callback_data="support_question")],
+        [InlineKeyboardButton(text="💡 Taklif", callback_data="support_suggestion")],
+        [InlineKeyboardButton(text="💬 Boshqa", callback_data="support_other")]
+    ])
+    
+    await callback.message.answer(
+        "📞 *Admin bilan bog'lanish*\n\n"
+        "Muammo turini tanlang:",
+        reply_markup=keyboard
+    )
+    await callback.answer()
 
-async def main():
-    print("🚀 Professional Bot ishga tushmoqda...")
-    print(f"👤 Admin ID: {ADMIN_ID}")
-    print(f"🌐 Port: {PORT}")
+@dp.callback_query(F.data.startswith("support_"))
+async def handle_support_category(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    category = callback.data.replace("support_", "")
     
-    # Setup connection pool for faster performance
-    await setup_connection_pool()
-    print("⚡ Connection pool initialized")
+    category_names = {
+        'bug': '🐛 Texnik muammo',
+        'question': '❓ Savol', 
+        'suggestion': '💡 Taklif',
+        'other': '💬 Boshqa'
+    }
     
-    # Start web server in background
-    asyncio.create_task(start_web_server())
+    await state.update_data(support_category=category)
+    await state.set_state(SupportStates.waiting_message)
     
-    # Start bot polling
-    await dp.start_polling(bot)
+    await callback.message.answer(
+        f"📝 *{category_names.get(category, 'Xabar')}*\n\n"
+        "Xabaringizni yozing. Shuningdek, rasm yoki fayl yuborishingiz ham mumkin:"
+    )
+    await callback.answer()
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("🛑 Bot to'xtatildi.")
+@dp.message(SupportStates.waiting_message)
+async def handle_support_message(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    category = data.get('support_category', 'other')
+    
+    # Create ticket
+    ticket_id = f"{user_id}_{int(datetime.now().timestamp())}"
+    
+    user_data = users_db.get(str(user_id), {})
+    
+    ticket_data = {
+        'id': ticket_id,
+        'user_id': user_id,
+        'category': category,
+        'message': message.text or "Media fayl",
+        'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'status': 'open',
+        'user_name': f"{user_data.get('first_name', '')} {user_data.get('last_name', '')}".strip()
+    }
+    
+    support_tickets[ticket_id] = ticket_data
+
+# Send to admin
+category_names = {
+    'bug': '🐛 Texnik muammo',
+    'question': '❓ Savol',
+    'suggestion': '💡 Taklif', 
+    'other': '💬 Boshqa'
+}
+
+admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="💬 Javob berish", callback_data=f"reply_ticket_{ticket_id}")],
+    [InlineKeyboardButton(text="✅ Yopish", callback_data=f"close_ticket_{ticket_id}")]
+])
+
+admin_message = (
+    f"🎫 *Yangi support tiket*\n\n"
+    f"👤 Foydalanuvchi: {ticket_data['user_name']}\n"
+    f"🆔 ID: `{user_id}`\n"
+    f"📋 Kategoriya: {category_names.get(category, 'Noma\'lum')}\n"
+    f"📅 Vaqt: {ticket_data['created_at']}\n"
+    f"🆔 Tiket ID: `{ticket_id}`\n\n"
+    f"💬 *Xabar:*\n{message.text or 'Media fayl yuborilgan'}"
+)
+
+try:
+    # Forward message to admin
+    if message.text:
+        await bot.send_message(ADMIN_ID, admin_message, reply_markup=admin_keyboard)
+    else:
+        # Forward media
+        await message.forward(ADMIN_ID)
+        await bot.send_message(ADMIN_ID, admin_message, reply_markup=admin_keyboard)
+    
+    await message.answer(
+        f"✅ *Xabaringiz yuborildi!*\n\n"
+        f"🆔 Tiket ID: `{ticket_id}`\n"
+        f"📋 Kategoriya: {category_names.get(category)}\n"
+        f"⏱️ Admin odatda 24 soat ichida javob beradi.\n\n"
+        f"Javob kelganda sizga xabar beramiz."
+    )
+    
+except Exception as e:
+    print(f"Support ticket yuborishda xatolik: {e}")
+    await message.answer("❌ Xatolik yuz berdi. Qayta urinib ko'ring.")
+
+await state.clear()
