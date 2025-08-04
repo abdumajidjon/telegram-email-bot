@@ -2,7 +2,7 @@ import sys
 import os
 import asyncio
 import aiohttp
-import json
+from dotenv import load_dotenv  # .env faylini o'qish uchun kutubxona
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -14,9 +14,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# Environment variable dan token olish
-API_TOKEN = os.environ.get('BOT_TOKEN', "8403878780:AAGebqROs5PhBejKf5alU4lBwL-JNG-0pWs")
-PORT = int(os.environ.get('PORT', 8000))
+# .env faylini yuklash
+load_dotenv()
+
+# Atrof-muhitdan tokenni olish
+API_TOKEN = os.getenv('BOT_TOKEN')
+PORT = int(os.getenv('PORT', 8000))  # Agar PORT o'rnatilmagan bo'lsa, 8000 ni olish
 ADMIN_ID = 976525232  # Sizning Telegram ID
 
 BASE_URLS = {
@@ -75,6 +78,7 @@ def get_stats():
         'pending': pending_users_count
     }
 
+# Key extraction and email formatting functions (unchanged)
 def extract_keys_from_text(text: str) -> list[str]:
     keys = []
     for line in text.splitlines():
@@ -584,3 +588,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Bot to'xtatildi.")
+
